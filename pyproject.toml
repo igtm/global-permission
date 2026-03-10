@@ -1,6 +1,6 @@
 [project]
 name = "global-permission"
-version = "0.0.2"
+version = "0.0.3"
 description = "Unified permission sync and enforcement for AI coding agent CLIs."
 readme = "README.md"
 requires-python = ">=3.13"
