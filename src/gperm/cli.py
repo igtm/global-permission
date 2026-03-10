@@ -3,20 +3,22 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Annotated
 
-import tomlkit
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from gperm import __version__
-from gperm.adapters import unique_adapters
+from gperm.adapters import get_adapter, unique_adapters
 from gperm.adapters.base import AdapterContext
 from gperm.config import load_config, render_config_for_display, write_sample_config
+from gperm.formats import write_data
 from gperm.i18n import Translator
+from gperm.importers import build_import_plan, merged_import_config
 from gperm.operations import OperationPlan
 from gperm.util import xdg_config_home
 
@@ -71,22 +73,6 @@ CommandOption = Annotated[
     str | None,
     typer.Option("--command", help=t("command.help")),
 ]
-
-
-def _as_toml(payload: dict[str, object]) -> str:
-    def sanitize(value):
-        if value is None:
-            return ""
-        if isinstance(value, dict):
-            return {key: sanitize(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [sanitize(item) for item in value]
-        return value
-
-    doc = tomlkit.document()
-    doc["config"] = tomlkit.item(sanitize(payload))
-    return tomlkit.dumps(doc)
-
 
 def _resolve_runtime(project: Path | None, config_path: Path | None) -> tuple[dict[str, str], object, AdapterContext]:
     env = dict(os.environ)
@@ -194,6 +180,23 @@ def _print_warnings(warnings: list[str]) -> None:
     console.print(table)
 
 
+def _run_version(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+        completed = subprocess.run(
+            [*parts, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+
+    output = (completed.stdout or completed.stderr).strip().splitlines()
+    return output[0].strip() if output else ""
+
+
 def _validated_level(level: str) -> str:
     normalized = level.lower()
     if normalized not in {"global", "project", "all"}:
@@ -257,10 +260,14 @@ def config_init(
     project: ProjectOption = None,
     project_local: Annotated[bool, typer.Option("--project-local", help="Write ./.gperm/config.toml.")] = False,
     force: Annotated[bool, typer.Option("--force", help="Overwrite an existing config file.")] = False,
+    if_missing: Annotated[bool, typer.Option("--if-missing", help="Do nothing when the target config already exists.")] = False,
 ) -> None:
     env = dict(os.environ)
     project_root = (project or Path.cwd()).resolve()
     target = (project_root / ".gperm" / "config.toml") if project_local else (xdg_config_home(env) / "gperm" / "config.toml")
+    if target.exists() and if_missing and not force:
+        console.print(f"{t('init.skipped')}: {target}")
+        return
     try:
         write_sample_config(target, force=force)
     except FileExistsError:
@@ -297,6 +304,207 @@ def agents_command() -> None:
             notes,
         )
     console.print(table)
+
+
+@app.command("import", help=t("import.help"))
+def import_command(
+    agent_name: Annotated[str, typer.Argument()],
+    source_path: Annotated[Path, typer.Argument()],
+    target: Annotated[Path | None, typer.Option("--target", help="Target gperm config path.")] = None,
+    profile: Annotated[str | None, typer.Option("--profile", help="Profile name to create or replace.")] = None,
+    force: Annotated[bool, typer.Option("--force", help="Replace an existing imported profile with the same name.")] = False,
+) -> None:
+    env = dict(os.environ)
+    normalized = agent_name.lower().replace(" ", "").replace("-", "")
+    if normalized not in {"claude", "opencode"}:
+        raise typer.BadParameter("Import currently supports only: claude, opencode.")
+
+    resolved_source = source_path.expanduser().resolve()
+    if not resolved_source.exists():
+        raise typer.BadParameter(f"Source file does not exist: {resolved_source}")
+
+    if normalized == "claude" and resolved_source.suffix != ".json":
+        raise typer.BadParameter("Claude import expects a JSON settings file.")
+    if normalized == "opencode" and resolved_source.suffix not in {".json", ".jsonc"}:
+        raise typer.BadParameter("OpenCode import expects a JSON or JSONC config file.")
+
+    plan = build_import_plan(
+        "claude" if normalized == "claude" else "opencode",
+        resolved_source,
+        env,
+        target_path=target,
+        profile_name=profile,
+    )
+    merged = merged_import_config(plan.target_path, plan, replace_existing_profile=force)
+    write_data(plan.target_path, "toml", merged)
+
+    table = Table(title=f"{agent_name} import")
+    table.add_column(t("doctor.item"))
+    table.add_column(t("doctor.details"))
+    table.add_row(t("import.source"), str(plan.source_path))
+    table.add_row(t("import.target"), str(plan.target_path))
+    table.add_row(t("import.scope"), plan.scope)
+    table.add_row(t("import.profile"), plan.profile_name)
+    console.print(table)
+    _print_warnings(plan.warnings)
+    console.print(f"{t('import.wrote')}: {plan.target_path}")
+
+
+@app.command("doctor", help=t("doctor.help"))
+def doctor_command(
+    project: ProjectOption = None,
+    config_path: ConfigOption = None,
+    agent: AgentOption = None,
+    output_format: Annotated[str, typer.Option("--format", help=t("format.help"))] = "table",
+) -> None:
+    env, loaded, context = _resolve_runtime(project, config_path)
+    output_format = _validated_format(output_format)
+    selected = _selected_adapters(loaded, agent)
+    operations, warnings, resolved_profiles, ignored = _collect_operations(
+        loaded=loaded,
+        context=context,
+        requested_agents=[adapter.metadata.key for adapter in selected],
+        level="all",
+        profile_override=None,
+    )
+    operations_by_agent: dict[str, list[OperationPlan]] = {}
+    for operation in operations:
+        operations_by_agent.setdefault(operation.agent, []).append(operation)
+
+    failures = 0
+    summary_rows: list[dict[str, str]] = []
+    config_rows: list[dict[str, str]] = []
+    agent_rows: list[dict[str, str]] = []
+
+    active_sources = ", ".join(source.label for source in loaded.config.sources)
+    config_rows.append(
+        {
+            "item": t("doctor.active_sources"),
+            "status": t("doctor.ok") if loaded.config.sources else t("doctor.warn"),
+            "details": active_sources or t("doctor.using_defaults"),
+        }
+    )
+    config_rows.append(
+        {
+            "item": str(loaded.user_config_path),
+            "status": t("doctor.found") if loaded.user_config_path.exists() else t("doctor.missing"),
+            "details": "user config",
+        }
+    )
+    config_rows.append(
+        {
+            "item": str(loaded.project_config_path),
+            "status": t("doctor.found") if loaded.project_config_path.exists() else t("doctor.missing"),
+            "details": "project override",
+        }
+    )
+    if ignored:
+        config_rows.append(
+            {
+                "item": t("doctor.project_ignored"),
+                "status": t("doctor.warn"),
+                "details": str(context.project_root),
+            }
+        )
+
+    for adapter in selected:
+        command = loaded.config.resolve_command(adapter.metadata.key)
+        executable = shlex.split(command)[0]
+        resolved_binary = shutil.which(executable, path=env.get("PATH"))
+        version = _run_version(command) if resolved_binary else ""
+        profile_name = resolved_profiles.get(adapter.metadata.key, loaded.config.resolve_profile(adapter.metadata.key, context.project_root, context.env).name)
+        adapter_operations = operations_by_agent.get(adapter.metadata.key, [])
+        drift_count = sum(1 for operation in adapter_operations if operation.changed())
+        missing_paths = [str(operation.path) for operation in adapter_operations if not operation.path.exists()]
+        status = t("doctor.ok")
+        details: list[str] = [f"{t('doctor.profile')}: {profile_name}", f"{t('doctor.command')}: {command}"]
+
+        if not resolved_binary:
+            status = t("doctor.fail")
+            failures += 1
+            details.append("binary not found on PATH")
+        else:
+            details.append(resolved_binary)
+            if version:
+                details.append(version)
+
+        if drift_count:
+            if status != t("doctor.fail"):
+                status = t("doctor.warn")
+            details.append(f"drift={drift_count}")
+        if missing_paths:
+            if status != t("doctor.fail"):
+                status = t("doctor.warn")
+            details.append("missing: " + ", ".join(missing_paths))
+
+        for operation in adapter_operations:
+            op_status = t("doctor.ok")
+            if not operation.path.exists():
+                op_status = t("doctor.missing")
+            elif operation.changed():
+                op_status = t("doctor.warn")
+            agent_rows.append(
+                {
+                    "agent": adapter.metadata.display_name,
+                    "item": operation.scope,
+                    "status": op_status,
+                    "details": str(operation.path),
+                }
+            )
+
+        summary_rows.append(
+            {
+                "item": adapter.metadata.display_name,
+                "status": status,
+                "details": " | ".join(details),
+            }
+        )
+
+    payload = {
+        "project_root": str(context.project_root),
+        "ignored": ignored,
+        "config": config_rows,
+        "summary": summary_rows,
+        "agent_paths": agent_rows,
+        "warnings": warnings,
+        "failures": failures,
+    }
+
+    if output_format == "json":
+        console.print_json(json.dumps(payload, ensure_ascii=False))
+    else:
+        console.print(f"\n[bold cyan]gperm doctor[/bold cyan] - {t('doctor.title')}\n")
+
+        config_table = Table(title=t("doctor.config"))
+        config_table.add_column(t("doctor.item"))
+        config_table.add_column(t("doctor.status"))
+        config_table.add_column(t("doctor.details"))
+        for row in config_rows:
+            config_table.add_row(row["item"], row["status"], row["details"])
+        console.print(config_table)
+
+        summary_table = Table(title=t("doctor.summary"))
+        summary_table.add_column(t("doctor.item"))
+        summary_table.add_column(t("doctor.status"))
+        summary_table.add_column(t("doctor.details"))
+        for row in summary_rows:
+            summary_table.add_row(row["item"], row["status"], row["details"])
+        console.print(summary_table)
+
+        paths_table = Table(title=t("doctor.agents"))
+        paths_table.add_column("Agent")
+        paths_table.add_column(t("doctor.item"))
+        paths_table.add_column(t("doctor.status"))
+        paths_table.add_column(t("doctor.details"))
+        for row in agent_rows:
+            paths_table.add_row(row["agent"], row["item"], row["status"], row["details"])
+        console.print(paths_table)
+        _print_warnings(warnings)
+        if failures == 0:
+            console.print(t("doctor.no_issues"))
+
+    if failures:
+        raise typer.Exit(1)
 
 
 @app.command("check", help=t("check.help"))

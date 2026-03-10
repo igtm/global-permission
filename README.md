@@ -47,12 +47,21 @@ uv sync
 uv run gperm --help
 ```
 
+One-line installer:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/igtm/global-permission/main/install.sh | bash
+```
+
 ## Commands
 
 ```bash
 gperm --help
 gperm --version
 gperm agents
+gperm import claude ~/.claude/settings.json
+gperm import opencode ~/.config/opencode/opencode.jsonc
+gperm doctor
 gperm config init
 gperm config show
 gperm check
@@ -97,12 +106,29 @@ command = "codex"
 profile = "safe"
 ```
 
+## Import native settings
+
+Import a Claude or OpenCode native config into gperm:
+
+```bash
+gperm import claude ~/.claude/settings.json
+gperm import opencode ~/.config/opencode/opencode.jsonc
+```
+
+Behavior:
+
+- Claude global config imports into `~/.config/gperm/config.toml`
+- OpenCode global config imports into `~/.config/gperm/config.toml`
+- Project-local source files import into `./.gperm/config.toml`
+- Imported profiles default to `imported-claude` or `imported-opencode`
+
 ## Notes
 
 - `gperm` updates only permission-related keys and leaves unrelated settings intact.
 - JSONC files are parsed correctly, but comments and whitespace may be normalized on write.
 - For agents that cannot persist some permission concepts natively, `gperm` reports the gap instead of silently dropping it.
 - Gemini sidecar policy files are generated under `~/.config/gperm/generated/` or `./.gperm/generated/`.
+- `install.sh` installs `gperm`, creates a starter config when missing, and runs `gperm doctor`.
 
 ## Release automation
 
