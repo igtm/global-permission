@@ -115,3 +115,5 @@ profile = "safe"
 
 - `RELEASE_GITHUB_TOKEN`
 - `PYPI_API_TOKEN`
+
+smoke test なら、docs だけの小さな PR に release label を 1 つ付ければ一連の pipeline を確認できます。
