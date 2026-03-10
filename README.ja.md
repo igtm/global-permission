@@ -45,9 +45,18 @@ uv sync
 uv run gperm --help
 ```
 
+ワンライナー:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/igtm/global-permission/main/install.sh | bash
+```
+
 ## よく使うコマンド
 
 ```bash
+gperm import claude ~/.claude/settings.json
+gperm import opencode ~/.config/opencode/opencode.jsonc
+gperm doctor
 gperm config init
 gperm config show
 gperm check
@@ -90,12 +99,29 @@ command = "codex"
 profile = "safe"
 ```
 
+## ネイティブ設定の取り込み
+
+Claude / OpenCode のネイティブ設定を gperm config に取り込めます。
+
+```bash
+gperm import claude ~/.claude/settings.json
+gperm import opencode ~/.config/opencode/opencode.jsonc
+```
+
+動作:
+
+- Claude の global config は `~/.config/gperm/config.toml` に取り込みます
+- OpenCode の global config は `~/.config/gperm/config.toml` に取り込みます
+- project 側の source file は `./.gperm/config.toml` に取り込みます
+- profile 名の既定値は `imported-claude` / `imported-opencode` です
+
 ## 注意
 
 - `gperm` は権限関連キーだけを書き換え、その他の設定は保持します。
 - JSONC は正しく読めますが、書き戻し時に comment や空白は正規化されることがあります。
 - 各 CLI が表現できない権限概念は、黙って捨てずに warning として表示します。
 - Gemini の sidecar policy は `~/.config/gperm/generated/` または `./.gperm/generated/` に生成されます。
+- `install.sh` は `gperm` をインストールし、設定が無ければ初期 config を作り、最後に `gperm doctor` を実行します。
 
 ## Release 自動化
 
