@@ -123,6 +123,8 @@ Required GitHub secrets:
 - `RELEASE_GITHUB_TOKEN`
 - `PYPI_API_TOKEN`
 
+For a smoke test, a docs-only PR with one release label is enough to exercise the full pipeline.
+
 ## References
 
 - Claude Code permissions: <https://code.claude.com/docs/en/permissions>
